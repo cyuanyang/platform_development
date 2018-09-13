@@ -18,9 +18,6 @@
 
 #include <llvm/Support/raw_ostream.h>
 
-#include <google/protobuf/text_format.h>
-#include <google/protobuf/io/zero_copy_stream_impl.h>
-
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,16 +27,16 @@
 abi_util::CompatibilityStatusIR HeaderAbiDiff::GenerateCompatibilityReport() {
   using abi_util::TextFormatToIRReader;
   std::unique_ptr<abi_util::TextFormatToIRReader> old_reader =
-      TextFormatToIRReader::CreateTextFormatToIRReader("protobuf", old_dump_);
+      TextFormatToIRReader::CreateTextFormatToIRReader(text_format_old_);
   std::unique_ptr<abi_util::TextFormatToIRReader> new_reader =
-      TextFormatToIRReader::CreateTextFormatToIRReader("protobuf", new_dump_);
-  if (!old_reader || !new_reader || !old_reader->ReadDump() ||
-      !new_reader->ReadDump()) {
+      TextFormatToIRReader::CreateTextFormatToIRReader(text_format_new_);
+  if (!old_reader || !new_reader || !old_reader->ReadDump(old_dump_) ||
+      !new_reader->ReadDump(new_dump_)) {
     llvm::errs() << "Could not create Text Format readers\n";
     ::exit(1);
   }
   std::unique_ptr<abi_util::IRDiffDumper> ir_diff_dumper =
-      abi_util::IRDiffDumper::CreateIRDiffDumper("protobuf", cr_);
+      abi_util::IRDiffDumper::CreateIRDiffDumper(text_format_diff_, cr_);
   abi_util::CompatibilityStatusIR status =
       CompareTUs(old_reader.get(), new_reader.get(), ir_diff_dumper.get());
   if (!ir_diff_dumper->Dump()) {
@@ -49,31 +46,16 @@ abi_util::CompatibilityStatusIR HeaderAbiDiff::GenerateCompatibilityReport() {
   return status;
 }
 
-template <typename F>
-static void AddTypesToMap(std::map<std::string, const abi_util::TypeIR *> *dst,
-                          const abi_util::TextFormatToIRReader *tu, F func) {
-  AddToMap(dst, tu->GetRecordTypes(), func);
-  AddToMap(dst, tu->GetEnumTypes(), func);
-  AddToMap(dst, tu->GetPointerTypes(), func);
-  AddToMap(dst, tu->GetBuiltinTypes(), func);
-  AddToMap(dst, tu->GetArrayTypes(), func);
-  AddToMap(dst, tu->GetLvalueReferenceTypes(), func);
-  AddToMap(dst, tu->GetRvalueReferenceTypes(), func);
-  AddToMap(dst, tu->GetQualifiedTypes(), func);
-}
-
 abi_util::CompatibilityStatusIR HeaderAbiDiff::CompareTUs(
     const abi_util::TextFormatToIRReader *old_tu,
     const abi_util::TextFormatToIRReader *new_tu,
     abi_util::IRDiffDumper *ir_diff_dumper) {
   // Collect all old and new types in maps, so that we can refer to them by
   // type name / linker_set_key later.
-  std::map<std::string, const abi_util::TypeIR *> old_types;
-  std::map<std::string, const abi_util::TypeIR *> new_types;
-  AddTypesToMap(&old_types, old_tu,
-                [](const abi_util::TypeIR *e) {return e->GetLinkerSetKey();});
-  AddTypesToMap(&new_types, new_tu,
-                [](const abi_util::TypeIR *e) {return e->GetLinkerSetKey();});
+  const AbiElementMap<const abi_util::TypeIR *> old_types =
+      old_tu->GetTypeGraph();
+  const AbiElementMap<const abi_util::TypeIR *> new_types =
+      new_tu->GetTypeGraph();
 
   // Collect fills in added, removed ,unsafe and safe function diffs.
   if (!CollectDynsymExportables(old_tu->GetFunctions(), new_tu->GetFunctions(),
@@ -108,81 +90,120 @@ abi_util::CompatibilityStatusIR HeaderAbiDiff::CompareTUs(
   return combined_status;
 }
 
+std::pair<AbiElementMap<const abi_util::EnumTypeIR *>,
+          AbiElementMap<const abi_util::RecordTypeIR *>>
+HeaderAbiDiff::ExtractUserDefinedTypes(
+    const abi_util::TextFormatToIRReader *tu) {
+  AbiElementMap<const abi_util::EnumTypeIR *> enum_types;
+  AbiElementMap<const abi_util::RecordTypeIR *> record_types;
+  // Iterate through the ODRListMap, if there is more than 1 element in the
+  // list, we cannot really unique the type by name, so skip it. If not, add a
+  // map entry UniqueId -> const Record(Enum)TypeIR *.
+  for (auto &it : tu->GetODRListMap()) {
+    auto &odr_list = it.second;
+    if (odr_list.size() != 1) {
+      continue;
+    }
+    const abi_util::TypeIR *type = *(odr_list.begin());
+    const abi_util::RecordTypeIR *record_type = nullptr;
+    switch (type->GetKind()) {
+      case abi_util::RecordTypeKind:
+        record_type = static_cast<const abi_util::RecordTypeIR *>(type);
+        if (record_type->IsAnonymous()) {
+          continue;
+        }
+        record_types.emplace(
+            record_type->GetUniqueId(), record_type);
+        break;
+      case abi_util::EnumTypeKind:
+        enum_types.emplace(
+            static_cast<const abi_util::EnumTypeIR *>(type)->GetUniqueId(),
+            static_cast<const abi_util::EnumTypeIR *>(type));
+        break;
+      case abi_util::FunctionTypeKind:
+        continue;
+      default:
+        // Only user defined types should have ODR list entries.
+        assert(0);
+    }
+  }
+  return std::make_pair(std::move(enum_types), std::move(record_types));
+}
+
 bool HeaderAbiDiff::CollectUserDefinedTypes(
     const abi_util::TextFormatToIRReader *old_tu,
     const abi_util::TextFormatToIRReader *new_tu,
-    const std::map<std::string, const abi_util::TypeIR *> &old_types_map,
-    const std::map<std::string, const abi_util::TypeIR *> &new_types_map,
+    const AbiElementMap<const abi_util::TypeIR *> &old_types_map,
+    const AbiElementMap<const abi_util::TypeIR *> &new_types_map,
     abi_util::IRDiffDumper *ir_diff_dumper) {
+
+  auto old_enums_and_records_extracted = ExtractUserDefinedTypes(old_tu);
+  auto new_enums_and_records_extracted = ExtractUserDefinedTypes(new_tu);
+
   return CollectUserDefinedTypesInternal(
-      old_tu->GetRecordTypes(), new_tu->GetRecordTypes(), old_types_map,
+      old_enums_and_records_extracted.second,
+      new_enums_and_records_extracted.second, old_types_map,
       new_types_map, ir_diff_dumper) &&
-      CollectUserDefinedTypesInternal(old_tu->GetEnumTypes(),
-                                      new_tu->GetEnumTypes(), old_types_map,
-                                      new_types_map, ir_diff_dumper);
+      CollectUserDefinedTypesInternal(old_enums_and_records_extracted.first,
+                                      new_enums_and_records_extracted.first,
+                                      old_types_map, new_types_map,
+                                      ir_diff_dumper);
 }
 
 template <typename T>
 bool HeaderAbiDiff::CollectUserDefinedTypesInternal(
-    const std::vector<T> &old_ud_types,
-    const std::vector<T> &new_ud_types,
-    const std::map<std::string, const abi_util::TypeIR *> &old_types_map,
-    const std::map<std::string, const abi_util::TypeIR *> &new_types_map,
+    const AbiElementMap<const T*> &old_ud_types_map,
+    const AbiElementMap<const T*> &new_ud_types_map,
+    const AbiElementMap<const abi_util::TypeIR *> &old_types_map,
+    const AbiElementMap<const abi_util::TypeIR *> &new_types_map,
     abi_util::IRDiffDumper *ir_diff_dumper) {
-  // No elf information for records and enums.
-  std::map<std::string, const T *> old_ud_types_map;
-  std::map<std::string, const T *> new_ud_types_map;
-
-  abi_util::AddToMap(&old_ud_types_map, old_ud_types,
-                     [](const T *e)
-                     { return e->GetLinkerSetKey();});
-
-  abi_util::AddToMap(&new_ud_types_map, new_ud_types,
-                     [](const T *e)
-                     { return e->GetLinkerSetKey();});
 
   return Collect(old_ud_types_map, new_ud_types_map, nullptr, nullptr,
-                 ir_diff_dumper) &&
+                 ir_diff_dumper, old_types_map, new_types_map) &&
       PopulateCommonElements(old_ud_types_map, new_ud_types_map, old_types_map,
                              new_types_map, ir_diff_dumper,
-                             abi_util::IRDiffDumper::Unreferenced);
+                             abi_util::DiffMessageIR::Unreferenced);
 }
 
 template <typename T, typename ElfSymbolType>
 bool HeaderAbiDiff::CollectDynsymExportables(
-    const std::vector<T> &old_exportables,
-    const std::vector<T> &new_exportables,
-    const std::vector<ElfSymbolType> &old_elf_symbols,
-    const std::vector<ElfSymbolType> &new_elf_symbols,
-    const std::map<std::string, const abi_util::TypeIR *> &old_types_map,
-    const std::map<std::string, const abi_util::TypeIR *> &new_types_map,
+    const AbiElementMap<T> &old_exportables,
+    const AbiElementMap<T> &new_exportables,
+    const AbiElementMap<ElfSymbolType> &old_elf_symbols,
+    const AbiElementMap<ElfSymbolType> &new_elf_symbols,
+    const AbiElementMap<const abi_util::TypeIR *> &old_types_map,
+    const AbiElementMap<const abi_util::TypeIR *> &new_types_map,
     abi_util::IRDiffDumper *ir_diff_dumper) {
-  std::map<std::string, const T *> old_exportables_map;
-  std::map<std::string, const T *> new_exportables_map;
-  std::map<std::string, const abi_util::ElfSymbolIR *> old_elf_symbol_map;
-  std::map<std::string, const abi_util::ElfSymbolIR *> new_elf_symbol_map;
+  AbiElementMap<const T *> old_exportables_map;
+  AbiElementMap<const T *> new_exportables_map;
+  AbiElementMap<const abi_util::ElfSymbolIR *> old_elf_symbol_map;
+  AbiElementMap<const abi_util::ElfSymbolIR *> new_elf_symbol_map;
 
   abi_util::AddToMap(&old_exportables_map, old_exportables,
-                     [](const T *e)
-                     { return e->GetLinkerSetKey();});
+                     [](auto e) { return e->first;},
+                     [](auto e) {return &(e->second);});
   abi_util::AddToMap(&new_exportables_map, new_exportables,
-                     [](const T *e)
-                     { return e->GetLinkerSetKey();});
+                     [](auto e) { return e->first;},
+                     [](auto e) { return &(e->second);});
+
   abi_util::AddToMap(
       &old_elf_symbol_map, old_elf_symbols,
-      [](const ElfSymbolType *symbol) { return symbol->GetName();});
+      [](auto e) { return e->first;},
+      [](auto e) {return &(e->second);});
+
   abi_util::AddToMap(
       &new_elf_symbol_map, new_elf_symbols,
-      [](const ElfSymbolType *symbol) { return symbol->GetName();});
+      [](auto e) { return e->first;},
+      [](auto e) {return &(e->second);});
 
   if (!Collect(old_exportables_map,
                new_exportables_map, &old_elf_symbol_map, &new_elf_symbol_map,
-               ir_diff_dumper) ||
+               ir_diff_dumper, old_types_map, new_types_map) ||
       !CollectElfSymbols(old_elf_symbol_map, new_elf_symbol_map,
                          ir_diff_dumper) ||
       !PopulateCommonElements(old_exportables_map, new_exportables_map,
                               old_types_map, new_types_map, ir_diff_dumper,
-                              abi_util::IRDiffDumper::Referenced)) {
+                              abi_util::DiffMessageIR::Referenced)) {
     llvm::errs() << "Diffing dynsym exportables failed\n";
     return false;
   }
@@ -197,17 +218,20 @@ bool HeaderAbiDiff::CollectDynsymExportables(
 
 template <typename T>
 bool HeaderAbiDiff::Collect(
-    const std::map<std::string, const T*> &old_elements_map,
-    const std::map<std::string, const T*> &new_elements_map,
-    const std::map<std::string, const abi_util::ElfSymbolIR *> *old_elf_map,
-    const std::map<std::string, const abi_util::ElfSymbolIR *> *new_elf_map,
-    abi_util::IRDiffDumper *ir_diff_dumper) {
+    const AbiElementMap<const T*> &old_elements_map,
+    const AbiElementMap<const T*> &new_elements_map,
+    const AbiElementMap<const abi_util::ElfSymbolIR *> *old_elf_map,
+    const AbiElementMap<const abi_util::ElfSymbolIR *> *new_elf_map,
+    abi_util::IRDiffDumper *ir_diff_dumper,
+    const AbiElementMap<const abi_util::TypeIR *> &old_types_map,
+    const AbiElementMap<const abi_util::TypeIR *> &new_types_map) {
   if (!PopulateRemovedElements(
       old_elements_map, new_elements_map, new_elf_map, ir_diff_dumper,
-      abi_util::IRDiffDumper::Removed) ||
+      abi_util::DiffMessageIR::Removed, old_types_map) ||
       !PopulateRemovedElements(new_elements_map, old_elements_map, old_elf_map,
                                ir_diff_dumper,
-                               abi_util::IRDiffDumper::DiffKind::Added)) {
+                               abi_util::IRDiffDumper::DiffKind::Added,
+                               new_types_map)) {
     llvm::errs() << "Populating functions in report failed\n";
     return false;
   }
@@ -215,8 +239,8 @@ bool HeaderAbiDiff::Collect(
 }
 
 bool HeaderAbiDiff::CollectElfSymbols(
-    const std::map<std::string, const abi_util::ElfSymbolIR *> &old_symbols,
-    const std::map<std::string, const abi_util::ElfSymbolIR *> &new_symbols,
+    const AbiElementMap<const abi_util::ElfSymbolIR *> &old_symbols,
+    const AbiElementMap<const abi_util::ElfSymbolIR *> &new_symbols,
     abi_util::IRDiffDumper *ir_diff_dumper) {
   std::vector<const abi_util::ElfSymbolIR *> removed_elements =
       abi_util::FindRemovedElements(old_symbols, new_symbols);
@@ -244,26 +268,31 @@ bool HeaderAbiDiff::PopulateElfElements(
 
 template <typename T>
 bool HeaderAbiDiff::PopulateRemovedElements(
-    const std::map<std::string, const T*> &old_elements_map,
-    const std::map<std::string, const T*> &new_elements_map,
-    const std::map<std::string, const abi_util::ElfSymbolIR *> *elf_map,
+    const AbiElementMap<const T*> &old_elements_map,
+    const AbiElementMap<const T*> &new_elements_map,
+    const AbiElementMap<const abi_util::ElfSymbolIR *> *elf_map,
     abi_util::IRDiffDumper *ir_diff_dumper,
-    abi_util::IRDiffDumper::DiffKind diff_kind) {
+    abi_util::IRDiffDumper::DiffKind diff_kind,
+    const AbiElementMap<const abi_util::TypeIR *> &removed_types_map) {
   std::vector<const T *> removed_elements =
       abi_util::FindRemovedElements(old_elements_map, new_elements_map);
-  if (!DumpLoneElements(removed_elements, elf_map, ir_diff_dumper, diff_kind)) {
+  if (!DumpLoneElements(removed_elements, elf_map, ir_diff_dumper, diff_kind,
+                        removed_types_map)) {
     llvm::errs() << "Dumping added / removed element to report failed\n";
     return false;
   }
   return true;
 }
 
+// Find the common elements (common records, common enums, common functions etc)
+// Dump the differences (we need type maps for this diff since we'll get
+// reachable types from here)
 template <typename T>
 bool HeaderAbiDiff::PopulateCommonElements(
-    const std::map<std::string, const T *> &old_elements_map,
-    const std::map<std::string, const T *> &new_elements_map,
-    const std::map<std::string, const abi_util::TypeIR *> &old_types,
-    const std::map<std::string, const abi_util::TypeIR *> &new_types,
+    const AbiElementMap<const T *> &old_elements_map,
+    const AbiElementMap<const T *> &new_elements_map,
+    const AbiElementMap<const abi_util::TypeIR *> &old_types,
+    const AbiElementMap<const abi_util::TypeIR *> &new_types,
     abi_util::IRDiffDumper *ir_diff_dumper,
     abi_util::IRDiffDumper::DiffKind diff_kind) {
   std::vector<std::pair<const T *, const T *>> common_elements =
@@ -279,9 +308,10 @@ bool HeaderAbiDiff::PopulateCommonElements(
 template <typename T>
 bool HeaderAbiDiff::DumpLoneElements(
     std::vector<const T *> &elements,
-    const std::map<std::string, const abi_util::ElfSymbolIR *> *elf_map,
+    const AbiElementMap<const abi_util::ElfSymbolIR *> *elf_map,
     abi_util::IRDiffDumper *ir_diff_dumper,
-    abi_util::IRDiffDumper::DiffKind diff_kind) {
+    abi_util::IRDiffDumper::DiffKind diff_kind,
+    const AbiElementMap<const abi_util::TypeIR *> &types_map) {
   // If the record / enum has source file information, skip it.
   std::smatch source_file_match;
   std::regex source_file_regex(" at ");
@@ -302,7 +332,9 @@ bool HeaderAbiDiff::DumpLoneElements(
                           source_file_regex)) {
       continue;
     }
-    if (!ir_diff_dumper->AddLinkableMessageIR(element, diff_kind)) {
+    auto element_copy = *element;
+    ReplaceTypeIdsWithTypeNames(types_map, &element_copy);
+    if (!ir_diff_dumper->AddLinkableMessageIR(&element_copy, diff_kind)) {
       llvm::errs() << "Couldn't dump added /removed element\n";
       return false;
     }
@@ -310,12 +342,11 @@ bool HeaderAbiDiff::DumpLoneElements(
   return true;
 }
 
-
 template <typename T>
 bool HeaderAbiDiff::DumpDiffElements(
     std::vector<std::pair<const T *,const T *>> &pairs,
-    const std::map<std::string, const abi_util::TypeIR *> &old_types,
-    const std::map<std::string, const abi_util::TypeIR *> &new_types,
+    const AbiElementMap<const abi_util::TypeIR *> &old_types,
+    const AbiElementMap<const abi_util::TypeIR *> &new_types,
     abi_util::IRDiffDumper *ir_diff_dumper,
     abi_util::IRDiffDumper::DiffKind diff_kind) {
   for (auto &&pair : pairs) {
@@ -329,7 +360,9 @@ bool HeaderAbiDiff::DumpDiffElements(
     }
     abi_diff_wrappers::DiffWrapper<T> diff_wrapper(old_element, new_element,
                                                    ir_diff_dumper, old_types,
-                                                   new_types, &type_cache_);
+                                                   new_types,
+                                                   diff_policy_options_,
+                                                   &type_cache_);
     if (!diff_wrapper.DumpDiff(diff_kind)) {
       llvm::errs() << "Failed to diff elements\n";
       return false;

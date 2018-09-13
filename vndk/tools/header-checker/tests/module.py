@@ -35,7 +35,7 @@ def relative_to_abs_path_list(relative_path_list):
 
 class Module(object):
     def __init__(self, name, arch, srcs, version_script, cflags,
-                 export_include_dirs, api):
+                 export_include_dirs, api, output_format=None):
         self.name = name
         self.arch = arch
         self.srcs = relative_to_abs_path_list(srcs)
@@ -46,6 +46,7 @@ class Module(object):
             self.arch_cflags = ARCH_TARGET_CFLAGS.get(self.arch)
         self.export_include_dirs = relative_to_abs_path_list(export_include_dirs)
         self.api = api
+        self.output_format = output_format
 
     def get_name(self):
         return self.name
@@ -68,6 +69,9 @@ class Module(object):
     def get_api(self):
         return self.api
 
+    def get_output_format(self):
+        return self.output_format
+
     def make_lsdump(self, default_cflags):
         """ For each source file, produce a .sdump file, and link them to form
             an lsump file"""
@@ -82,28 +86,38 @@ class Module(object):
                     self.cflags + self.arch_cflags + default_cflags)
             return run_header_abi_linker(output_lsdump, dumps_to_link,
                                          self.version_script, self.api,
-                                         self.arch)
+                                         self.arch, self.output_format)
+
     @staticmethod
-    def mutate_module_for_all_arches(module):
-        modules = []
+    def mutate_module_for_arch(module, target_arch):
         name = module.get_name()
         srcs = module.get_srcs()
         version_script = module.get_version_script()
         cflags = module.get_cflags()
         export_include_dirs = module.get_export_include_dirs()
         api = module.get_api()
+        output_format = module.get_output_format()
+        return Module(name, target_arch, srcs, version_script, cflags,
+                      export_include_dirs, api, output_format)
+
+    @staticmethod
+    def mutate_module_for_all_arches(module):
+        modules = []
         for target_arch in TARGET_ARCHS:
-            modules.append(Module(name, target_arch, srcs, version_script,
-                                  cflags, export_include_dirs, api))
+            modules.append(Module.mutate_module_for_arch(module, target_arch))
         return modules
 
     @staticmethod
     def get_test_modules():
         modules = []
-        for module in TEST_MODULES:
+        for module in TEST_MODULES.values():
             if module.get_arch() == '':
                 modules += Module.mutate_module_for_all_arches(module)
         return modules
+
+    @staticmethod
+    def get_test_module_by_name(name):
+        return TEST_MODULES[name]
 
 TEST_MODULES = [
     Module(
@@ -118,6 +132,28 @@ TEST_MODULES = [
         api = 'current',
     ),
     Module(
+        name = 'libc_and_cpp_with_opaque_ptr_a',
+        srcs = ['integration/c_and_cpp/source1.cpp',
+                'integration/c_and_cpp/source2.c',
+                ],
+        version_script = 'integration/c_and_cpp/map.txt',
+        export_include_dirs = ['integration/c_and_cpp/include'],
+        cflags = ['-DOPAQUE_STRUCT_A=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libc_and_cpp_with_opaque_ptr_b',
+        srcs = ['integration/c_and_cpp/source1.cpp',
+                'integration/c_and_cpp/source2.c',
+                ],
+        version_script = 'integration/c_and_cpp/map.txt',
+        export_include_dirs = ['integration/c_and_cpp/include'],
+        cflags = ['-DOPAQUE_STRUCT_B=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
         name = 'libc_and_cpp_with_unused_struct',
         srcs = ['integration/c_and_cpp/source1.cpp',
                 'integration/c_and_cpp/source2.c',
@@ -125,6 +161,17 @@ TEST_MODULES = [
         version_script = 'integration/c_and_cpp/map.txt',
         export_include_dirs = ['integration/c_and_cpp/include'],
         cflags = ['-DINCLUDE_UNUSED_STRUCTS=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libc_and_cpp_with_unused_cstruct',
+        srcs = ['integration/c_and_cpp/source1.cpp',
+                'integration/c_and_cpp/source2.c',
+                ],
+        version_script = 'integration/c_and_cpp/map.txt',
+        export_include_dirs = ['integration/c_and_cpp/include'],
+        cflags = ['-DINCLUDE_UNUSED_STRUCTS=1', '-DMAKE_UNUSED_STRUCT_C=1'],
         arch = '',
         api = 'current',
     ),
@@ -141,6 +188,18 @@ TEST_MODULES = [
         api = 'current',
     ),
     Module(
+        name = 'libgolden_cpp_odr',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DTEST_ODR'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
         name = 'libgolden_cpp_add_function',
         srcs = ['integration/cpp/gold/golden_1.cpp',
                 'integration/cpp/gold/high_volume_speaker.cpp',
@@ -149,6 +208,19 @@ TEST_MODULES = [
         version_script = 'integration/cpp/gold/map_add_function.txt',
         export_include_dirs = ['integration/cpp/gold/include'],
         cflags = ['-DGOLDEN_ADD_FUNCTION=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_add_function_and_unexported_elf',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = \
+            'integration/cpp/gold/map_add_function_elf_symbol.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_ADD_FUNCTION=1', '-DADD_UNEXPORTED_ELF_SYMBOL'],
         arch = '',
         api = 'current',
     ),
@@ -173,6 +245,18 @@ TEST_MODULES = [
         version_script = 'integration/cpp/gold/map_added_globvar.txt',
         export_include_dirs = ['integration/cpp/gold/include'],
         cflags = ['-DGOLDEN_ADD_GLOBVAR=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_add_global_variable_private',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map_added_globvar.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_ADD_GLOBVAR=1', '-DGOLDEN_ADD_GLOBVAR_PRIVATE'],
         arch = '',
         api = 'current',
     ),
@@ -308,4 +392,112 @@ TEST_MODULES = [
         arch = '',
         api = 'current',
     ),
+    Module(
+        name = 'libreproducability',
+        srcs = ['integration/c_and_cpp/reproducability.c',
+                ],
+        version_script = 'integration/c_and_cpp/repro_map.txt',
+        export_include_dirs = ['integration/c_and_cpp/include'],
+        cflags = [],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_member_name_changed',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_CHANGE_MEMBER_NAME_SAME_OFFSET=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_function_pointer',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_FUNCTION_POINTER=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_function_pointer_parameter_added',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_FUNCTION_POINTER_ADD_PARAM=1',
+                  '-DGOLDEN_FUNCTION_POINTER=1'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_internal_public_struct',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_WITH_INTERNAL_STRUCT',
+                  '-DGOLDEN_WITH_PUBLIC_INTERNAL_STRUCT'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_internal_private_struct',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_WITH_INTERNAL_STRUCT'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_inheritance_type_changed',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = ['-DGOLDEN_CHANGE_INHERITANCE_TYPE'],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libpure_virtual_function',
+        srcs = ['integration/cpp/pure_virtual/pure_virtual_function.cpp'],
+        export_include_dirs = ['integration/cpp/pure_virtual/include'],
+        version_script = '',
+        cflags = [],
+        arch = '',
+        api = 'current',
+    ),
+    Module(
+        name = 'libgolden_cpp_json',
+        srcs = ['integration/cpp/gold/golden_1.cpp',
+                'integration/cpp/gold/high_volume_speaker.cpp',
+                'integration/cpp/gold/low_volume_speaker.cpp',
+                ],
+        version_script = 'integration/cpp/gold/map.txt',
+        export_include_dirs = ['integration/cpp/gold/include'],
+        cflags = [],
+        arch = '',
+        api = 'current',
+        output_format = 'Json'
+    ),
 ]
+
+TEST_MODULES = { m.name: m for m in TEST_MODULES }

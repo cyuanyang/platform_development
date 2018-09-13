@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <ir_representation.h>
+
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ELFTypes.h>
 #include <llvm/Object/SymbolSize.h>
@@ -32,6 +34,8 @@ using llvm::object::ELFDataTypeTypedefHelper;
 
 namespace abi_util {
 
+std::string RealPath(const std::string &path);
+
 std::set<std::string> CollectAllExportedHeaders(
     const std::vector<std::string> &exported_header_dirs);
 
@@ -48,9 +52,9 @@ class VersionScriptParser {
                       const std::string &api);
   bool Parse();
 
-  const std::set<std::string> &GetFunctions();
+  const std::map<std::string, ElfFunctionIR> &GetFunctions();
 
-  const std::set<std::string> &GetGlobVars();
+  const std::map<std::string, ElfObjectIR> &GetGlobVars();
 
   const std::set<std::string> &GetFunctionRegexs();
 
@@ -79,8 +83,8 @@ class VersionScriptParser {
  private:
   const std::string &version_script_;
   const std::string &arch_;
-  std::set<std::string> functions_;
-  std::set<std::string> globvars_;
+  std::map<std::string, ElfFunctionIR> functions_;
+  std::map<std::string, ElfObjectIR> globvars_;
   // Added to speed up version script parsing and linking.
   std::set<std::string> function_regexs_;
   std::set<std::string> globvar_regexs_;
@@ -100,8 +104,8 @@ inline std::string FindAndReplace(const std::string &candidate_str,
 class SoFileParser {
 public:
     static std::unique_ptr<SoFileParser> Create(const ObjectFile *obj);
-    virtual const std::set<std::string> &GetFunctions() const = 0;
-    virtual const std::set<std::string> &GetGlobVars() const = 0;
+    virtual const std::map<std::string, ElfFunctionIR> &GetFunctions() const = 0;
+    virtual const std::map<std::string, ElfObjectIR> &GetGlobVars() const = 0;
     virtual ~SoFileParser() {};
     virtual void GetSymbols() = 0;
 };
@@ -109,9 +113,9 @@ public:
 template<typename T>
 class ELFSoFileParser : public SoFileParser {
  public:
-  const std::set<std::string> &GetFunctions() const override;
+  const std::map<std::string, ElfFunctionIR> &GetFunctions() const override;
 
-  const std::set<std::string> &GetGlobVars() const override;
+  const std::map<std::string, ElfObjectIR> &GetGlobVars() const override;
 
   LLVM_ELF_IMPORT_TYPES_ELFT(T)
   typedef ELFFile<T> ELFO;
@@ -122,8 +126,8 @@ class ELFSoFileParser : public SoFileParser {
   void GetSymbols() override;
  private:
   const ELFObjectFile<T> *obj_;
-  std::set<std::string> functions_;
-  std::set<std::string> globvars_;
+  std::map<std::string, abi_util::ElfFunctionIR> functions_;
+  std::map<std::string, abi_util::ElfObjectIR> globvars_;
 
  private:
   bool IsSymbolExported(const Elf_Sym *elf_sym) const;
@@ -144,15 +148,17 @@ std::vector<T> FindRemovedElements(
   return removed_elements;
 }
 
-template <typename T, typename F, typename K, typename Iterable>
-inline void AddToMap(std::map<K, T> *dst, Iterable &src, F get_key) {
+template <typename K, typename T, typename Iterable, typename KeyGetter,
+          typename ValueGetter>
+inline void AddToMap(std::map<K, T> *dst, Iterable &src, KeyGetter get_key,
+                     ValueGetter get_value) {
   for (auto &&element : src) {
-    dst->insert(std::make_pair(get_key(&element), &element));
+    dst->insert(std::make_pair(get_key(&element), get_value(&element)));
   }
 }
 
-template <typename F, typename K, typename Iterable>
-inline void AddToSet(std::set<K> *dst, Iterable &src, F get_key) {
+template <typename K, typename Iterable, typename KeyGetter>
+inline void AddToSet(std::set<K> *dst, Iterable &src, KeyGetter get_key) {
   for (auto &&element : src) {
     dst->insert(get_key(element));
   }

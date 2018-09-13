@@ -6,6 +6,7 @@ LOCAL_SRC_FILES := $(call all-subdir-java-files)
 LOCAL_JAVA_LIBRARIES := android.test.runner
 
 LOCAL_PACKAGE_NAME := launchperf
+LOCAL_PRIVATE_PLATFORM_APIS := true
 
 LOCAL_MODULE_TAGS := tests
 

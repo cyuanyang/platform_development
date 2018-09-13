@@ -44,6 +44,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -240,6 +243,8 @@ public class Monkey {
 
     private static final String TOMBSTONE_PREFIX = "tombstone_";
 
+    private static int NUM_READ_TOMBSTONE_RETRIES = 5;
+
     private HashSet<Long> mTombstones = null;
 
     float[] mFactors = new float[MonkeySourceRandom.FACTORZ_COUNT];
@@ -260,8 +265,7 @@ public class Monkey {
      */
     private class ActivityController extends IActivityController.Stub {
         public boolean activityStarting(Intent intent, String pkg) {
-            boolean allow = MonkeyUtils.getPackageFilter().checkEnteringPackage(pkg)
-                    || (DEBUG_ALLOW_ANY_STARTS != 0);
+            final boolean allow = isActivityStartingAllowed(intent, pkg);
             if (mVerbose > 0) {
                 // StrictMode's disk checks end up catching this on
                 // userdebug/eng builds due to PrintStream going to a
@@ -277,6 +281,34 @@ public class Monkey {
             currentPackage = pkg;
             currentIntent = intent;
             return allow;
+        }
+
+        private boolean isActivityStartingAllowed(Intent intent, String pkg) {
+            if (MonkeyUtils.getPackageFilter().checkEnteringPackage(pkg)) {
+                return true;
+            }
+            if (DEBUG_ALLOW_ANY_STARTS != 0) {
+                return true;
+            }
+            // In case the activity is launching home and the default launcher
+            // package is disabled, allow anyway to prevent ANR (see b/38121026)
+            final Set<String> categories = intent.getCategories();
+            if (intent.getAction() == Intent.ACTION_MAIN
+                    && categories != null
+                    && categories.contains(Intent.CATEGORY_HOME)) {
+                try {
+                    final ResolveInfo resolveInfo =
+                            mPm.resolveIntent(intent, intent.getType(), 0, UserHandle.myUserId());
+                    final String launcherPackage = resolveInfo.activityInfo.packageName;
+                    if (pkg.equals(launcherPackage)) {
+                        return true;
+                    }
+                } catch (RemoteException e) {
+                    Logger.err.println("** Failed talking with package manager!");
+                    return false;
+                }
+            }
+            return false;
         }
 
         public boolean activityResuming(String pkg) {
@@ -395,7 +427,7 @@ public class Monkey {
     }
 
     /**
-     * Run "cat /data/anr/traces.txt". Wait about 5 seconds first, to let the
+     * Dump the most recent ANR trace. Wait about 5 seconds first, to let the
      * asynchronous report writing complete.
      */
     private void reportAnrTraces() {
@@ -403,7 +435,25 @@ public class Monkey {
             Thread.sleep(5 * 1000);
         } catch (InterruptedException e) {
         }
-        commandLineReport("anr traces", "cat /data/anr/traces.txt");
+
+        // The /data/anr directory might have multiple files, dump the most
+        // recent of those files.
+        File[] recentTraces = new File("/data/anr/").listFiles();
+        if (recentTraces != null) {
+            File mostRecent = null;
+            long mostRecentMtime = 0;
+            for (File trace : recentTraces) {
+                final long mtime = trace.lastModified();
+                if (mtime > mostRecentMtime) {
+                    mostRecentMtime = mtime;
+                    mostRecent = trace;
+                }
+            }
+
+            if (mostRecent != null) {
+                commandLineReport("anr traces", "cat " + mostRecent.getAbsolutePath());
+            }
+        }
     }
 
     /**
@@ -1248,6 +1298,7 @@ public class Monkey {
                 newStones.add(f.lastModified());
                 if (mTombstones == null || !mTombstones.contains(f.lastModified())) {
                     result = true;
+                    waitForTombstoneToBeWritten(Paths.get(TOMBSTONES_PATH.getPath(), t));
                     Logger.out.println("** New tombstone found: " + f.getAbsolutePath()
                                        + ", size: " + f.length());
                 }
@@ -1258,6 +1309,35 @@ public class Monkey {
         mTombstones = newStones;
 
         return result;
+    }
+
+    /**
+     * Wait for the given tombstone file to be completely written.
+     *
+     * @param path The path of the tombstone file.
+     */
+    private void waitForTombstoneToBeWritten(Path path) {
+        boolean isWritten = false;
+        try {
+            // Ensure file is done writing by sleeping and comparing the previous and current size
+            for (int i = 0; i < NUM_READ_TOMBSTONE_RETRIES; i++) {
+                long size = Files.size(path);
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) { }
+                if (size > 0 && Files.size(path) == size) {
+                    //File size is bigger than 0 and hasn't changed
+                    isWritten = true;
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            Logger.err.println("Failed to get tombstone file size: " + e.toString());
+        }
+        if (!isWritten) {
+            Logger.err.println("Incomplete tombstone file.");
+            return;
+        }
     }
 
     /**

@@ -19,8 +19,8 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wnested-anon-types"
-#include "proto/abi_dump.pb.h"
-#include "proto/abi_diff.pb.h"
+#include "abi_dump.pb.h"
+#include "abi_diff.pb.h"
 #pragma clang diagnostic pop
 
 #include <google/protobuf/text_format.h>
@@ -42,6 +42,31 @@ inline abi_diff::CompatibilityStatus CompatibilityStatusIRToProtobuf(
       break;
   }
   return abi_diff::CompatibilityStatus::COMPATIBLE;
+}
+
+inline abi_dump::ElfSymbolBinding ElfSymbolBindingIRToProtobuf(
+    ElfSymbolIR::ElfSymbolBinding binding) {
+  switch(binding) {
+    case ElfSymbolIR::ElfSymbolBinding::Global:
+      return abi_dump::ElfSymbolBinding::Global;
+    case ElfSymbolIR::ElfSymbolBinding::Weak:
+      return abi_dump::ElfSymbolBinding::Weak;
+  }
+  // We skip symbols of all other Bindings
+  // TODO: Add all bindings, don't leave out info
+  assert(0);
+}
+
+inline ElfSymbolIR::ElfSymbolBinding ElfSymbolBindingProtobufToIR(
+    abi_dump::ElfSymbolBinding binding) {
+  switch(binding) {
+    case abi_dump::ElfSymbolBinding::Global:
+      return ElfSymbolIR::ElfSymbolBinding::Global;
+    case abi_dump::ElfSymbolBinding::Weak:
+      return ElfSymbolIR::ElfSymbolBinding::Weak;
+  }
+  // We skip symbols of all other Bindings
+  assert(0);
 }
 
 inline abi_dump::AccessSpecifier AccessIRToProtobuf(AccessSpecifierIR access) {
@@ -83,6 +108,25 @@ inline abi_dump::RecordKind RecordKindIRToProtobuf(
 
     default:
       return abi_dump::RecordKind::struct_kind;
+  }
+  // Should not be reached
+  assert(false);
+}
+
+inline RecordTypeIR::RecordKind RecordKindProtobufToIR(
+    abi_dump::RecordKind kind) {
+  switch (kind) {
+    case abi_dump::RecordKind::struct_kind:
+      return RecordTypeIR::struct_kind;
+
+    case abi_dump::RecordKind::class_kind:
+      return RecordTypeIR::class_kind;
+
+    case abi_dump::RecordKind::union_kind:
+      return RecordTypeIR::union_kind;
+
+    default:
+      return RecordTypeIR::struct_kind;
   }
   // Should not be reached
   assert(false);
@@ -167,6 +211,9 @@ class IRToProtobufConverter {
   static bool AddVTableLayout(
       abi_dump::RecordType *record_protobuf, const RecordTypeIR *record_ir);
 
+  static bool AddTagTypeInfo(abi_dump::TagType *tag_type_protobuf,
+                             const TagTypeIR *tag_type_ir);
+
   static bool AddEnumFields(abi_dump::EnumType *enum_protobuf,
                             const EnumTypeIR *enum_ir);
  public:
@@ -174,8 +221,17 @@ class IRToProtobufConverter {
 
   static abi_dump::RecordType ConvertRecordTypeIR(const RecordTypeIR *recordp);
 
-  static bool AddFunctionParameters(abi_dump::FunctionDecl *function_protobuf,
-                                    const FunctionIR *function_ir);
+  static abi_dump::FunctionType ConvertFunctionTypeIR (
+      const FunctionTypeIR *function_typep);
+
+  template <typename CFunctionLikeMessage>
+  static bool AddFunctionParametersAndSetReturnType(
+      CFunctionLikeMessage *function_like_protobuf,
+      const CFunctionLikeIR *cfunction_like_ir);
+
+  template <typename CFunctionLikeMessage>
+  static bool AddFunctionParameters(CFunctionLikeMessage *function_protobuf,
+                                    const CFunctionLikeIR *cfunction_like_ir);
 
   static abi_dump::FunctionDecl ConvertFunctionIR(const FunctionIR *functionp);
 
@@ -220,9 +276,10 @@ class IRDiffToProtobufConverter {
     abi_diff::CXXBaseSpecifierDiff *base_specifier_diff_protobuf,
     const CXXBaseSpecifierDiffIR *base_specifier_diff_ir);
 
-  static bool AddRecordFieldsRemoved(
+  static bool AddRecordFields(
     abi_diff::RecordTypeDiff *record_diff_protobuf,
-    const std::vector<const RecordFieldIR *> &record_fields_removed_ir);
+    const std::vector<const RecordFieldIR *> &record_fields_removed_ir,
+    bool removed);
 
   static bool AddRecordFieldDiffs(
     abi_diff::RecordTypeDiff *record_diff_protobuf,
@@ -265,16 +322,24 @@ class ProtobufIRDumper : public IRDumper, public IRToProtobufConverter {
 
   bool AddBuiltinTypeIR(const BuiltinTypeIR *);
 
+  bool AddFunctionTypeIR(const FunctionTypeIR *function_typep);
+
   // Functions and global variables.
   bool AddFunctionIR(const FunctionIR *);
 
   bool AddGlobalVarIR(const GlobalVarIR *);
 
+  bool AddElfFunctionIR(const ElfFunctionIR *);
+
+  bool AddElfObjectIR(const ElfObjectIR *);
+
  public:
   ProtobufIRDumper(const std::string &dump_path)
       : IRDumper(dump_path), tu_ptr_(new abi_dump::TranslationUnit()) { }
 
-  bool AddLinkableMessageIR(const LinkableMessageIR *);
+  bool AddLinkableMessageIR(const LinkableMessageIR *) override;
+
+  bool AddElfSymbolMessageIR(const ElfSymbolIR *) override;
 
   bool Dump() override;
 
@@ -288,49 +353,45 @@ class ProtobufIRDumper : public IRDumper, public IRToProtobufConverter {
 class ProtobufTextFormatToIRReader : public TextFormatToIRReader {
  public:
 
-  virtual bool ReadDump() override;
+  ProtobufTextFormatToIRReader(const std::set<std::string> *exported_headers)
+      : TextFormatToIRReader(exported_headers) { }
 
-  ProtobufTextFormatToIRReader(const std::string &dump_path)
-      : TextFormatToIRReader(dump_path) { }
+  bool ReadDump(const std::string &dump_file) override;
 
  private:
-  std::vector<FunctionIR> ReadFunctions(
-       const abi_dump::TranslationUnit &tu);
+  void ReadFunctions(const abi_dump::TranslationUnit &tu);
 
-  std::vector<GlobalVarIR> ReadGlobalVariables(
-       const abi_dump::TranslationUnit &tu);
+  void ReadGlobalVariables(const abi_dump::TranslationUnit &tu);
 
-  std::vector<EnumTypeIR> ReadEnumTypes(const abi_dump::TranslationUnit &tu);
+  void ReadEnumTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<RecordTypeIR> ReadRecordTypes(
-      const abi_dump::TranslationUnit &tu);
+  void ReadRecordTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<PointerTypeIR> ReadPointerTypes(
-       const abi_dump::TranslationUnit &tu);
+  void ReadFunctionTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<BuiltinTypeIR> ReadBuiltinTypes(
-       const abi_dump::TranslationUnit &tu);
+  void ReadPointerTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<QualifiedTypeIR> ReadQualifiedTypes(
-       const abi_dump::TranslationUnit &tu);
+  void ReadBuiltinTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<ArrayTypeIR> ReadArrayTypes(const abi_dump::TranslationUnit &tu);
+  void ReadQualifiedTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<LvalueReferenceTypeIR> ReadLvalueReferenceTypes(
-       const abi_dump::TranslationUnit &tu);
+  void ReadArrayTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<RvalueReferenceTypeIR> ReadRvalueReferenceTypes(
-       const abi_dump::TranslationUnit &tu);
+  void ReadLvalueReferenceTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<ElfFunctionIR> ReadElfFunctions (
-      const abi_dump::TranslationUnit &tu);
+  void ReadRvalueReferenceTypes(const abi_dump::TranslationUnit &tu);
 
-  std::vector<ElfObjectIR> ReadElfObjects (const abi_dump::TranslationUnit &tu);
+  void ReadElfFunctions (const abi_dump::TranslationUnit &tu);
+
+  void ReadElfObjects (const abi_dump::TranslationUnit &tu);
 
   void ReadTypeInfo(const abi_dump::BasicNamedAndTypedDecl &type_info,
                     TypeIR *typep);
 
   FunctionIR FunctionProtobufToIR(const abi_dump::FunctionDecl &);
+
+  FunctionTypeIR FunctionTypeProtobufToIR(
+      const abi_dump::FunctionType &function_type_protobuf);
 
   RecordTypeIR RecordTypeProtobufToIR(
        const abi_dump::RecordType &record_type_protobuf);
